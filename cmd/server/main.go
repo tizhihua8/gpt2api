@@ -143,6 +143,7 @@ func main() {
 
 	imageDAO := image.NewDAO(sqldb)
 	imageRunner := image.NewRunner(sched, imageDAO)
+	imageRunner.SetQuotaDecrementor(accDAO) // 生图成功后立即扣减账号额度
 	imagesH := &gateway.ImagesHandler{
 		Handler: gwH,
 		Runner:  imageRunner,

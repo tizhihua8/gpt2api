@@ -15,6 +15,12 @@ import (
 	"github.com/432539/gpt2api/pkg/logger"
 )
 
+// QuotaDecrementor 允许 Runner 在生图成功后立即扣减账号剩余额度,
+// 无需等待下一次后台探测即可在前端看到正确数字。
+type QuotaDecrementor interface {
+	DecrQuota(ctx context.Context, accountID uint64, n int) error
+}
+
 // Runner 单次/多次生图的执行器。封装完整的 chatgpt.com 协议链路:
 //
 //	ChatRequirements → PrepareFConversation → StreamFConversation (SSE) →
@@ -23,14 +29,18 @@ import (
 // IMG2 已正式上线,不再做"灰度命中判定 / preview_only 换账号重试"这些节流操作,
 // 拿到任意 file-service / sediment 引用即算成功,以速度和效率优先。
 type Runner struct {
-	sched *scheduler.Scheduler
-	dao   *DAO
+	sched     *scheduler.Scheduler
+	dao       *DAO
+	quotaDecr QuotaDecrementor // 生图成功后立即扣减账号额度(可空,空时跳过)
 }
 
 // NewRunner 构造 Runner。
 func NewRunner(sched *scheduler.Scheduler, dao *DAO) *Runner {
 	return &Runner{sched: sched, dao: dao}
 }
+
+// SetQuotaDecrementor 注入额度扣减器。
+func (r *Runner) SetQuotaDecrementor(qd QuotaDecrementor) { r.quotaDecr = qd }
 
 // ReferenceImage 是图生图/编辑的一张参考图输入。
 // 只需要提供原始字节 + 可选的文件名,Runner 会在运行时调用 chatgpt Client 上传。
@@ -143,6 +153,15 @@ func (r *Runner) Run(ctx context.Context, opt RunOptions) *RunResult {
 		if result.Status == StatusSuccess {
 			_ = r.dao.MarkSuccess(ctx, opt.TaskID, result.ConversationID,
 				result.FileIDs, result.SignedURLs, 0 /* credit_cost 由网关负责写 */)
+			// 成功后立即乐观扣减账号额度,n = 本次实际产出张数。
+			// 这样不用等后台探测,前端刷新后即可看到正确剩余数字。
+			if r.quotaDecr != nil && result.AccountID > 0 {
+				n := len(result.FileIDs)
+				if n == 0 {
+					n = opt.N
+				}
+				_ = r.quotaDecr.DecrQuota(context.Background(), result.AccountID, n)
+			}
 		} else {
 			_ = r.dao.MarkFailed(ctx, opt.TaskID, result.ErrorCode)
 		}

@@ -391,6 +391,21 @@ func (d *DAO) ApplyQuotaResult(ctx context.Context, id uint64, remaining, total 
 	return err
 }
 
+// DecrQuota 生图成功后立即乐观扣减账号剩余额度。
+// 这样无需等下次探测即可在前端看到正确剩余数字。
+// n 为本次消耗张数;GREATEST(0,...) 防止出现负值。
+func (d *DAO) DecrQuota(ctx context.Context, accountID uint64, n int) error {
+	if n <= 0 {
+		return nil
+	}
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE oai_accounts
+         SET image_quota_remaining = GREATEST(0, image_quota_remaining - ?)
+         WHERE id = ? AND deleted_at IS NULL`,
+		n, accountID)
+	return err
+}
+
 // ---- cookies ----
 
 func (d *DAO) UpsertCookies(ctx context.Context, accountID uint64, cookieEnc string) error {
