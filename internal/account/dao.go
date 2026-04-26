@@ -19,12 +19,33 @@ func NewDAO(db *sqlx.DB) *DAO { return &DAO{db: db} }
 func (d *DAO) DB() *sqlx.DB { return d.db }
 
 // fill 填充非 db 列的辅助字段。
+//
+// 这里把 today_used_count "归零"的逻辑也放进来:数据库里这个计数是按
+// today_used_date 增长的累计值,如果 today_used_date 不是今天(例如昨天用过 7 张,
+// 今天还没派发),那它就不再是"今日已用",前端却没法判断。统一在 DTO 出口
+// 这一层把不是今天的计数清零,避免前端/调度器各自再处理一遍。
 func fill(a *Account) {
 	if a == nil {
 		return
 	}
 	a.HasRT = a.RefreshTokenEnc.Valid && a.RefreshTokenEnc.String != ""
 	a.HasST = a.SessionTokenEnc.Valid && a.SessionTokenEnc.String != ""
+
+	if a.TodayUsedCount > 0 {
+		if !a.TodayUsedDate.Valid || !isSameLocalDay(a.TodayUsedDate.Time, time.Now()) {
+			a.TodayUsedCount = 0
+		}
+	}
+}
+
+// isSameLocalDay 用进程当前时区比较两个时间是不是同一天。
+// 不直接用 t.Date() 的原因:driver 把 DATE 还原成 time.Time 时 location 可能是 UTC,
+// 必须先 In(Local) 再比较年月日。
+func isSameLocalDay(a, b time.Time) bool {
+	loc := time.Local
+	a = a.In(loc)
+	b = b.In(loc)
+	return a.Year() == b.Year() && a.Month() == b.Month() && a.Day() == b.Day()
 }
 
 func fillAll(rows []*Account) {
@@ -105,16 +126,23 @@ func (d *DAO) List(ctx context.Context, status string, keyword string, offset, l
 	return rows, total, err
 }
 
-// ListDispatchable 调度器专用:返回 status=healthy 且 cooldown 到期、AT 未过期的候选。
+// ListDispatchable 调度器专用:返回 AT 有效且 cooldown 到期的候选账号。
+//
+// 接受 status IN ('healthy', 'warned'):
+//   - healthy: 正常
+//   - warned:  RT/ST 刷新失败但 AT 尚未到期,仍可继续出图直到 AT 过期
 func (d *DAO) ListDispatchable(ctx context.Context, limit int) ([]*Account, error) {
 	rows := make([]*Account, 0, limit)
 	now := time.Now()
 	err := d.db.SelectContext(ctx, &rows,
 		`SELECT * FROM oai_accounts
-         WHERE deleted_at IS NULL AND status = 'healthy'
+         WHERE deleted_at IS NULL AND status IN ('healthy', 'warned')
            AND (cooldown_until IS NULL OR cooldown_until <= ?)
            AND (token_expires_at IS NULL OR token_expires_at > ?)
-         ORDER BY CASE WHEN last_used_at IS NULL THEN 0 ELSE 1 END, last_used_at ASC
+         ORDER BY
+           CASE status WHEN 'healthy' THEN 0 ELSE 1 END,
+           CASE WHEN last_used_at IS NULL THEN 0 ELSE 1 END,
+           last_used_at ASC
          LIMIT ?`, now, now, limit)
 	fillAll(rows)
 	return rows, err
@@ -170,6 +198,28 @@ func (d *DAO) ListAllActiveIDs(ctx context.Context) ([]uint64, error) {
 	err := d.db.SelectContext(ctx, &ids,
 		`SELECT id FROM oai_accounts WHERE deleted_at IS NULL ORDER BY id ASC`)
 	return ids, err
+}
+
+// QuotaSummary 全局额度汇总。
+type QuotaSummary struct {
+	TotalRemaining int64 `db:"total_remaining" json:"total_remaining"` // 所有未软删账号剩余额度之和
+	TotalCapacity  int64 `db:"total_capacity"  json:"total_capacity"`  // 所有未软删账号上限之和
+	ActiveAccounts int64 `db:"active_accounts" json:"active_accounts"` // 未软删账号总数
+}
+
+// SumQuota 汇总所有未软删账号的额度(含 dead/suspicious)。
+// 账号失效只影响能否被调度出图,不影响其已探测到的额度数字;
+// 全部纳入统计才能正确反映账号池的实际剩余容量。
+func (d *DAO) SumQuota(ctx context.Context) (*QuotaSummary, error) {
+	var s QuotaSummary
+	err := d.db.GetContext(ctx, &s, `
+SELECT
+  COALESCE(SUM(image_quota_remaining), 0) AS total_remaining,
+  COALESCE(SUM(image_quota_total),     0) AS total_capacity,
+  COUNT(*)                                AS active_accounts
+FROM oai_accounts
+WHERE deleted_at IS NULL`)
+	return &s, err
 }
 
 func (d *DAO) Update(ctx context.Context, a *Account) error {
@@ -319,11 +369,19 @@ func (d *DAO) ApplyRefreshResult(
 }
 
 // RecordRefreshError 写入刷新失败原因,同时推进 last_refresh_at(避免 pressed-out 重试)。
+//
+// markDead=true 时:若当前 AT 尚未过期,只降为 'warned'(账号仍可被调度出图,AT 用完前
+// 不要让它离线);若 AT 已过期或为空则真正标 'dead'。
+// 这样避免"RT 失效但 AT 还有几天"的账号被提前下线。
 func (d *DAO) RecordRefreshError(ctx context.Context, id uint64, source string, reason string, markDead bool) error {
 	if markDead {
 		_, err := d.db.ExecContext(ctx,
 			`UPDATE oai_accounts
-             SET last_refresh_at = ?, last_refresh_source = ?, refresh_error = ?, status = 'dead'
+             SET last_refresh_at = ?, last_refresh_source = ?, refresh_error = ?,
+                 status = CASE
+                   WHEN token_expires_at IS NOT NULL AND token_expires_at > NOW() THEN 'warned'
+                   ELSE 'dead'
+                 END
              WHERE id = ? AND deleted_at IS NULL`,
 			time.Now(), source, reason, id)
 		return err
@@ -337,10 +395,24 @@ func (d *DAO) RecordRefreshError(ctx context.Context, id uint64, source string, 
 }
 
 // ApplyQuotaResult 更新图片额度探测结果;remaining/total = -1 表示保持原值。
+//
+// 关于 total 的写入策略:用 GREATEST 兜底而非直接覆盖。原因:
+//  1. 不同时期 ChatGPT 可能漏返 max_value,直接覆盖 0 会让 UI 退回"待探测";
+//  2. total 至少应该 ≥ 当前剩余(remaining),否则数据自相矛盾(剩 5 / 总 0)。
+//     用 GREATEST(image_quota_total, total_param, remaining_param) 一并保证。
+//
+// 这样:
+//   - 探测结果带回 total → 取传入值;
+//   - 没带回但带回了 remaining > 旧 total → 自动把 total 顶到 remaining;
+//   - 都没带回 → 保留旧 total,不会被无意清零。
 func (d *DAO) ApplyQuotaResult(ctx context.Context, id uint64, remaining, total int, resetAt *time.Time) error {
 	q := `UPDATE oai_accounts
           SET image_quota_remaining = CASE WHEN ? < 0 THEN image_quota_remaining ELSE ? END,
-              image_quota_total     = CASE WHEN ? < 0 THEN image_quota_total     ELSE ? END,
+              image_quota_total     = GREATEST(
+                  image_quota_total,
+                  CASE WHEN ? < 0 THEN 0 ELSE ? END,
+                  CASE WHEN ? < 0 THEN 0 ELSE ? END
+              ),
               image_quota_reset_at  = ?,
               image_quota_updated_at = ?
           WHERE id = ? AND deleted_at IS NULL`
@@ -350,7 +422,26 @@ func (d *DAO) ApplyQuotaResult(ctx context.Context, id uint64, remaining, total 
 	} else {
 		reset = nil
 	}
-	_, err := d.db.ExecContext(ctx, q, remaining, remaining, total, total, reset, time.Now(), id)
+	_, err := d.db.ExecContext(ctx, q,
+		remaining, remaining,
+		total, total,
+		remaining, remaining,
+		reset, time.Now(), id)
+	return err
+}
+
+// DecrQuota 生图成功后立即乐观扣减账号剩余额度。
+// 这样无需等下次探测即可在前端看到正确剩余数字。
+// n 为本次消耗张数;GREATEST(0,...) 防止出现负值。
+func (d *DAO) DecrQuota(ctx context.Context, accountID uint64, n int) error {
+	if n <= 0 {
+		return nil
+	}
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE oai_accounts
+         SET image_quota_remaining = GREATEST(0, image_quota_remaining - ?)
+         WHERE id = ? AND deleted_at IS NULL`,
+		n, accountID)
 	return err
 }
 

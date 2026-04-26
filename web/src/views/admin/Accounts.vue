@@ -390,6 +390,7 @@ async function onRefreshAll() {
       duration: 4000,
     })
     fetchList()
+    loadQuotaSummary()
   } catch (e: any) {
     ElMessage.error(e?.message || '刷新失败')
   } finally {
@@ -413,6 +414,7 @@ async function onProbeAll() {
       duration: 4000,
     })
     fetchList()
+    loadQuotaSummary()
   } catch (e: any) {
     ElMessage.error(e?.message || '探测失败')
   } finally {
@@ -683,10 +685,19 @@ function cloneAgg(): accountApi.ImportSummary {
   }
 }
 
+// ========== 额度汇总 ==========
+const quotaSummary = ref<accountApi.QuotaSummary | null>(null)
+async function loadQuotaSummary() {
+  try {
+    quotaSummary.value = await accountApi.getQuotaSummary()
+  } catch { /* noop */ }
+}
+
 onMounted(() => {
   fetchList()
   fetchProxies()
   loadAutoRefresh()
+  loadQuotaSummary()
 })
 </script>
 
@@ -696,7 +707,15 @@ onMounted(() => {
     <div class="card-block hdr">
       <div class="flex-between">
         <div class="hdr-left">
-          <h2 class="page-title">GPT 账号池</h2>
+          <div style="display:flex;align-items:baseline;gap:12px;flex-wrap:wrap">
+            <h2 class="page-title" style="margin:0">GPT 账号池</h2>
+            <el-tag v-if="quotaSummary" type="success" size="small" style="font-size:13px">
+              当前剩余总额度&nbsp;<b>{{ quotaSummary.total_remaining }}</b>
+              &nbsp;/&nbsp;{{ quotaSummary.total_capacity }}
+              &nbsp;（{{ quotaSummary.active_accounts }} 个账号）
+            </el-tag>
+            <el-tag v-else type="info" size="small">额度统计加载中…</el-tag>
+          </div>
           <div class="page-sub">
             统一管理 ChatGPT Plus / Team / Codex 账号:JSON / AT / RT / ST 批量导入 · 自动刷新 · 图片额度探测 · 风控熔断轮转
           </div>
@@ -846,6 +865,9 @@ onMounted(() => {
                       <template v-if="row.image_quota_total > 0">
                         {{ row.image_quota_total }}
                       </template>
+                      <template v-else-if="row.image_quota_remaining >= 0">
+                        ≈ {{ row.today_used_count + row.image_quota_remaining }}(估算)
+                      </template>
                       <template v-else>待探测</template>
                     </b>
                     <span v-if="row.image_quota_remaining >= 0" style="color:#a1a5ad">
@@ -853,8 +875,11 @@ onMounted(() => {
                     </span>
                   </div>
                   <div style="color:#a1a5ad">熔断阈值(仅用于停止派发):{{ row.daily_image_quota }} / 日</div>
-                  <div v-if="row.image_quota_total <= 0" style="color:#f5a623">
+                  <div v-if="row.image_quota_total <= 0 && row.image_quota_remaining < 0" style="color:#f5a623">
                     首次探测约 5 小时内完成;额度=0 时会忽略间隔立即补测。
+                  </div>
+                  <div v-else-if="row.image_quota_total <= 0" style="color:#f5a623">
+                    上游未返回 max_value,已用「今日已用 + 剩余」做估算;后续探测会回填精确值。
                   </div>
                 </div>
               </template>
@@ -863,6 +888,10 @@ onMounted(() => {
                 <span class="muted"> / </span>
                 <template v-if="row.image_quota_total > 0">
                   <b>{{ row.image_quota_total }}</b>
+                </template>
+                <template v-else-if="row.image_quota_remaining >= 0">
+                  <b>{{ row.today_used_count + row.image_quota_remaining }}</b>
+                  <span class="muted" style="font-size:11px"> ≈</span>
                 </template>
                 <template v-else>
                   <span class="muted" style="font-style:italic">待探测</span>

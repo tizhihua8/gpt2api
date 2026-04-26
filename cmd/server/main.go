@@ -18,6 +18,7 @@ import (
 	"github.com/432539/gpt2api/internal/auth"
 	"github.com/432539/gpt2api/internal/backup"
 	"github.com/432539/gpt2api/internal/billing"
+	"github.com/432539/gpt2api/internal/channel"
 	"github.com/432539/gpt2api/internal/config"
 	"github.com/432539/gpt2api/internal/db"
 	"github.com/432539/gpt2api/internal/gateway"
@@ -109,6 +110,11 @@ func main() {
 		log.Warn("model preload failed", zap.Error(err))
 	}
 
+	channelDAO := channel.NewDAO(sqldb)
+	channelSvc := channel.NewService(channelDAO, cipher)
+	channelRouter := channel.NewRouter(channelSvc)
+	channelH := channel.NewHandler(channelSvc, channelRouter)
+
 	rl := lock.NewRedisLock(rdb)
 	sched := scheduler.New(accSvc, proxySvc, rl, cfg.Scheduler)
 
@@ -139,16 +145,25 @@ func main() {
 		Limiter:   limiter,
 		Usage:     usageLogger,
 		AccSvc:    accSvc,
+		Channels:  channelRouter,
 	}
 
 	imageDAO := image.NewDAO(sqldb)
 	imageRunner := image.NewRunner(sched, imageDAO)
+	imageRunner.SetQuotaDecrementor(accDAO) // 生图成功后立即扣减账号额度
 	imagesH := &gateway.ImagesHandler{
 		Handler: gwH,
 		Runner:  imageRunner,
 		DAO:     imageDAO,
 	}
 	gwH.Images = imagesH // chat/completions 识别到图像模型时转派
+
+	// 把"上游签名 URL"翻译成"自家代理 URL":历史任务列表 / 详情接口
+	// 在序列化时调用,前端拿到的全是 /p/img/<task>/<idx>?... 的本地链接,
+	// 既不会泄漏上游鉴权 URL,也不会因为签名过期而 404。
+	image.SetProxyURLBuilder(func(taskID string, idx int) string {
+		return gateway.BuildImageProxyURL(taskID, idx, gateway.ImageProxyTTL)
+	})
 
 	auditDAO := audit.NewDAO(sqldb)
 	auditH := audit.NewHandler(auditDAO)
@@ -172,6 +187,7 @@ func main() {
 	adminUsageH := usage.NewAdminHandler(usageQDAO)
 	meUsageH := usage.NewMeHandler(usageQDAO)
 	meImageH := image.NewMeHandler(imageDAO)
+	adminImageH := image.NewAdminHandler(imageDAO)
 
 	mailSvc := mailer.New(mailer.Config{
 		Host:     cfg.SMTP.Host,
@@ -266,6 +282,8 @@ func main() {
 		ProxyH:   proxyH,
 		AccountH: accountH,
 
+		ChannelH: channelH,
+
 		GatewayH: gwH,
 		ImagesH:  imagesH,
 
@@ -279,8 +297,9 @@ func main() {
 		AdminKeyH:   adminKeyH,
 		AdminUsageH: adminUsageH,
 
-		MeUsageH: meUsageH,
-		MeImageH: meImageH,
+		MeUsageH:    meUsageH,
+		MeImageH:    meImageH,
+		AdminImageH: adminImageH,
 
 		RechargeH:      rechargeH,
 		AdminRechargeH: adminRechargeH,
